@@ -2,3 +2,11 @@ node_modules/
 api-keys.json
 *.log
 .env
+
+# Arquivos locais e dados de uso
+*.bak-*
+*-backup-*.json
+task-backup-*.xml
+models-cache.json
+oc-workspace/
+watchdog-node.vbs
