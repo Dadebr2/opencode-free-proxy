@@ -1,17 +1,71 @@
+// oc-api-proxy.mjs — OpenCode free models as OpenAI/Anthropic APIs.
+//
+// Why this exists: since ~2026-09-17 the OpenCode Zen free tier rejects every
+// client except the genuine opencode binary (TLS-fingerprint gate). Header
+// spoofing no longer works. This proxy drives the real binary's local
+// `opencode serve` API, so upstream calls are made by the genuine client.
+//
+// Works with both opencode v1 and v2 server APIs; the generation is detected
+// at startup. v2 turn: POST /api/session → /api/session/:id/prompt →
+// /api/experimental/session/:id/wait → GET /api/session/:id/message.
+// v1 turn: POST /session → POST /session/:id/message (already synchronous).
+//
+// Usage:
+//   node oc-api-proxy.mjs                 # auto-spawns `opencode serve`
+//   OC_SERVER=http://127.0.0.1:13284 \    # or use an already-running server
+//   OC_PASSWORD=pass node oc-api-proxy.mjs
+//
+// Env:
+//   PROXY_PORT   port for this proxy          (default 6447)
+//   OC_BIN       path to opencode binary      (default ~/.opencode/bin/opencode)
+//   OC_WORKDIR   working dir for the agent    (default ./oc-workspace)
+//   OC_SERVER    reuse an existing opencode serve instance
+//   OC_USERNAME  basic-auth user for OC_SERVER (default "opencode")
+//   OC_PASSWORD  basic-auth password for OC_SERVER
+//   OC_TIMEOUT   per-request timeout in sec   (default 600)
+//
+// Session behavior:
+//   - Send header `x-oc-session: <name>` (or OpenAI `user` field, or
+//     Anthropic metadata.user_id) to get a persistent multi-turn conversation.
+//   - Without a key, every request is a fresh self-contained session whose
+//     full message history is replayed as a transcript.
+//
+// Limitation: client-supplied `tools` schemas are not forwarded; the opencode
+// agent runs its own built-in tools (read/edit/bash) server-side and folds
+// results into the reply text.
+
 import express from "express";
 import crypto from "crypto";
-import https from "https";
 import fs from "fs";
+import os from "os";
+import path from "path";
+import http from "http";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
 
-const app = express();
-app.use(express.json({ limit: "10mb" }));
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PROXY_PORT = Number(process.env.PROXY_PORT || 6447);
+const OC_SERVER = process.env.OC_SERVER;
+const OC_USERNAME = process.env.OC_USERNAME || "opencode";
+const OC_PASSWORD = process.env.OC_PASSWORD;
+const OC_BIN = process.env.OC_BIN || findBinary();
+const OC_WORKDIR = process.env.OC_WORKDIR || path.join(HERE, "oc-workspace");
+const REQUEST_TIMEOUT = Number(process.env.OC_TIMEOUT || 600) * 1000;
 
-const PORT = process.env.PROXY_PORT || 6446;
-const OC_VERSION = "1.15.0";
-const PROXY_VERSION = "9";
+function findBinary() {
+  const candidates = [
+    path.join(os.homedir(), ".opencode", "bin", "opencode"),
+    path.join(os.homedir(), ".opencode", "bin", "opencode.exe"),
+    path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "@opencode", "cli", "bin", "opencode.exe"),
+    "/usr/local/bin/opencode",
+    "/usr/bin/opencode",
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  return "opencode";
+}
 
-// ── API Keys ───────────────────────────────────────────────────────
-const keysFile = process.env.KEYS_FILE || "./api-keys.json";
+// ── API keys (same scheme as server.mjs) ────────────────────────────
+const keysFile = process.env.KEYS_FILE || path.join(HERE, "api-keys.json");
 let apiKeys = {};
 function loadKeys() {
   try { apiKeys = JSON.parse(fs.readFileSync(keysFile, "utf8")); } catch {}
@@ -26,541 +80,538 @@ function loadKeys() {
 }
 loadKeys();
 
+function isLocalClient(req) {
+  const a = req.socket?.remoteAddress || "";
+  return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+}
 function auth(req) {
   const hdr = req.headers.authorization || req.headers["x-api-key"] || "";
   const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : hdr;
-  for (const [name, key] of Object.entries(apiKeys)) {
-    if (tok === key) return name;
-  }
+  for (const [name, key] of Object.entries(apiKeys)) if (tok === key) return name;
+  if (isLocalClient(req)) return "local";
   return null;
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
-function ocId(prefix) {
-  const ts = Date.now().toString(16);
-  const rnd = crypto.randomBytes(12).toString("base64url").slice(0, 16);
-  return `${prefix}_${ts}${rnd}`;
-}
+// ── opencode serve backend ──────────────────────────────────────────
+let ocBase = null;
+let ocAuth = null;
+let apiVersion = null; // "v1" | "v2", detected at startup
 
-const MODELS = [
-  "deepseek-v4-flash-free",
-  "big-pickle",
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "qwen3.6-plus-free",
-];
-
-// Track sessions per user (rotate every 30 min)
-const userSessions = {};
-function getSession(user) {
-  const now = Date.now();
-  if (!userSessions[user] || now - userSessions[user].ts > 30 * 60 * 1000) {
-    userSessions[user] = { id: ocId("ses"), ts: now };
+// Probe which server API generation this opencode is serving. v2 answers
+// /api/info with a version; v1 has no /api/* routes but returns its provider
+// list at /provider. (Unknown paths may answer 200 with HTML, so each probe
+// must validate the JSON shape, not just the status code.)
+async function detectApi() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const v2 = await ocReq("GET", "/api/info");
+      if (v2.status === 200 && v2.json?.version) {
+        apiVersion = "v2";
+        console.log(`[OC] opencode v2 API detected (v${v2.json.version})`);
+        return;
+      }
+      const v1 = await ocReq("GET", "/provider");
+      if (v1.status === 200 && v1.json?.all) {
+        apiVersion = "v1";
+        console.log("[OC] opencode v1 API detected");
+        return;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
   }
-  return userSessions[user].id;
+  throw new Error("opencode serve did not become healthy");
 }
 
-// ── Zen API transport ──────────────────────────────────────────────
-function zenRequest(model, messages, stream, tools, tool_choice, sessionId) {
-  const reqBody = { model, messages, stream: !!stream };
-  if (tools?.length) reqBody.tools = tools;
-  if (tool_choice) reqBody.tool_choice = tool_choice;
-  const body = JSON.stringify(reqBody);
-  const requestId = ocId("msg");
-
-  return {
-    body,
-    options: {
-      hostname: "opencode.ai",
-      port: 443,
-      path: "/zen/v1/chat/completions",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        "Authorization": "Bearer public",
-        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": requestId,
-        "x-opencode-session": sessionId,
-      },
-      timeout: 120000,
-    },
-  };
-}
-
-// Pipe Zen response to client (OpenAI format passthrough)
-function pipeZenResponse(zenOpts, body, stream, res) {
-  const req = https.request(zenOpts, (zenRes) => {
-    let firstChunk = null;
-    let headersSent = false;
-
-    zenRes.on("data", (chunk) => {
-      if (!firstChunk) {
-        firstChunk = chunk;
-        const str = chunk.toString().trim();
-
-        if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"'))) {
-          try {
-            const parsed = JSON.parse(str);
-            if (parsed.error || parsed.type === "error") {
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              console.log("[ZEN RATE LIMITED]", errMsg);
-              if (!res.headersSent) {
-                res.status(429).json({
-                  error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" }
-                });
-              }
-              zenRes.resume();
-              return;
-            }
-          } catch {}
-        }
-
-        headersSent = true;
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked",
-          });
-          res.flushHeaders();
-        } else {
-          res.writeHead(zenRes.statusCode, { "Content-Type": "application/json" });
-        }
-        res.write(firstChunk);
-        if (res.flush) res.flush();
-        return;
-      }
-      if (headersSent) {
-        res.write(chunk);
-        if (res.flush) res.flush();
-      }
-    });
-
-    zenRes.on("end", () => {
-      if (!headersSent && !firstChunk) {
-        console.log("[ZEN EMPTY] No response from Zen API");
-        if (!res.headersSent) {
-          res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
-        }
-        return;
-      }
-      if (headersSent) res.end();
-    });
-  });
-
-  req.on("error", (e) => {
-    console.log("[ZEN ERROR]", e.message);
-    if (!res.headersSent) {
-      res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
-    }
-  });
-
-  req.on("timeout", () => {
-    req.destroy();
-    console.log("[ZEN TIMEOUT]");
-    if (!res.headersSent) {
-      res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
-    }
-  });
-
-  req.write(body);
-  req.end();
-}
-
-// Collect full Zen response (non-streaming) and return parsed JSON
-function zenRequestFull(zenOpts, body) {
+function ocReq(method, pathname, body) {
   return new Promise((resolve, reject) => {
-    const req = https.request(zenOpts, (zenRes) => {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        try {
-          resolve({ status: zenRes.statusCode, data: JSON.parse(raw), raw });
-        } catch {
-          resolve({ status: zenRes.statusCode, data: null, raw });
-        }
-      });
-    });
+    const u = new URL(ocBase + pathname);
+    const data = body !== undefined ? JSON.stringify(body) : null;
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname,
+        method,
+        headers: {
+          ...(ocAuth ? { Authorization: ocAuth } : {}),
+          ...(data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}),
+        },
+        timeout: REQUEST_TIMEOUT,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString();
+          let json = null;
+          try { json = JSON.parse(raw); } catch {}
+          resolve({ status: res.statusCode, json, raw });
+        });
+      }
+    );
     req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-    req.write(body);
+    req.on("timeout", () => { req.destroy(); reject(new Error("opencode request timed out")); });
+    if (data) req.write(data);
     req.end();
   });
 }
 
-// ── Anthropic Messages → OpenAI conversion ─────────────────────────
-function anthropicToOpenAI(body) {
-  const messages = [];
-  if (body.system) {
-    const sys = typeof body.system === "string" ? body.system
-      : Array.isArray(body.system) ? body.system.map(b => b.text || "").join("\n") : "";
-    if (sys) messages.push({ role: "system", content: sys });
+let ocChild = null, backendReady = false, exitHooked = false;
+async function startBackend() {
+  if (OC_SERVER) {
+    ocBase = OC_SERVER.replace(/\/$/, "");
+    ocAuth = OC_PASSWORD
+      ? "Basic " + Buffer.from(`${OC_USERNAME}:${OC_PASSWORD}`).toString("base64")
+      : null;
+    await detectApi();
+    return;
   }
-  for (const msg of body.messages || []) {
-    if (typeof msg.content === "string") {
-      messages.push({ role: msg.role, content: msg.content });
-    } else if (Array.isArray(msg.content)) {
-      const text = msg.content
-        .filter(b => b.type === "text")
-        .map(b => b.text)
-        .join("\n");
-      // tool_use blocks → assistant tool_calls
-      const toolUses = msg.content.filter(b => b.type === "tool_use");
-      if (toolUses.length && msg.role === "assistant") {
-        messages.push({
-          role: "assistant",
-          content: text || null,
-          tool_calls: toolUses.map(t => ({
-            id: t.id,
-            type: "function",
-            function: { name: t.name, arguments: JSON.stringify(t.input || {}) },
-          })),
-        });
-      } else if (msg.content.some(b => b.type === "tool_result")) {
-        for (const b of msg.content.filter(b => b.type === "tool_result")) {
-          const resultText = typeof b.content === "string" ? b.content
-            : Array.isArray(b.content) ? b.content.map(c => c.text || "").join("\n") : "";
-          messages.push({ role: "tool", tool_call_id: b.tool_use_id, content: resultText });
-        }
-      } else {
-        messages.push({ role: msg.role, content: text });
-      }
+  if (OC_BIN === "opencode" && !fs.existsSync("/usr/bin/opencode")) {
+    try {
+      const { execSync } = await import("child_process");
+      execSync("command -v opencode", { stdio: "ignore" });
+    } catch {
+      throw new Error("opencode binary not found — set OC_BIN or install opencode");
     }
   }
+  fs.mkdirSync(OC_WORKDIR, { recursive: true });
+  const password = "oc-" + crypto.randomBytes(12).toString("hex");
+  const child = spawn(OC_BIN, ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
+    env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
+    cwd: OC_WORKDIR,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  ocChild = child;
+  child.on("exit", (code) => {
+    console.log("[OC] opencode serve exited with code", code);
+    if (ocChild !== child) return;
+    ocChild = null; ocBase = null; modelCache = null;
+    if (!backendReady) return;
+    backendReady = false;
+    console.log("[OC] reiniciando opencode serve em 2s...");
+    setTimeout(() => startBackend().then(() => getModels()).then((m) => { backendReady = true; console.log("[OC] backend recuperado:", m.length, "modelos"); }).catch((e) => { console.error("[OC] falha ao recuperar backend:", e.message); process.exit(1); }), 2000);
+  });
+  if (!exitHooked) {
+    exitHooked = true;
+    process.on("exit", () => { try { ocChild && ocChild.kill("SIGKILL"); } catch {} });
+    for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
+  }
 
-  const tools = (body.tools || []).map(t => ({
-    type: "function",
-    function: {
-      name: t.name,
-      description: t.description || "",
-      parameters: t.input_schema || {},
-    },
-  }));
-
-  return { messages, tools: tools.length ? tools : undefined };
+  const port = await new Promise((resolve, reject) => {
+    let buf = "";
+    const timer = setTimeout(() => reject(new Error("opencode serve did not start within 45s")), 45000);
+    const onData = (d) => {
+      buf += d.toString();
+      const m = buf.match(/listening on https?:\/\/[^:]+:(\d+)/);
+      if (m) { clearTimeout(timer); resolve(m[1]); }
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("exit", (c) => { clearTimeout(timer); reject(new Error(`opencode serve exited early (code ${c})`)); });
+  });
+  ocBase = `http://127.0.0.1:${port}`;
+  ocAuth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
+  console.log(`[OC] opencode serve backend on ${ocBase}`);
+  await detectApi();
 }
 
-// OpenAI response → Anthropic Messages format
-function openAIToAnthropic(oaiResp, model, inputTokens) {
-  const choice = oaiResp.choices?.[0];
-  if (!choice) {
-    return {
-      id: ocId("msg"),
-      type: "message",
-      role: "assistant",
-      content: [{ type: "text", text: "" }],
-      model,
-      stop_reason: "end_turn",
-      usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-    };
+// ── models ──────────────────────────────────────────────────────────
+let modelCache = null;
+async function getModels() {
+  if (modelCache) return modelCache;
+  if (apiVersion === "v2") {
+    let r; { const t0 = Date.now(); do { r = await ocReq("GET", "/api/model"); if (r.status === 200) break; if (Date.now() - t0 > 120000) break; console.log("[OC] aguardando plugins (" + r.status + ")..."); await new Promise((x) => setTimeout(x, 3000)); } while (true); }
+    const all = r.status === 200 ? r.json?.data : null;
+    if (!Array.isArray(all)) throw new Error("failed to list opencode models");
+    modelCache = [
+      ...new Set(
+        all
+          .filter((m) => m.providerID === "opencode" && m.enabled !== false && (m.modelID || m.id).endsWith("-free") || (m.providerID === "opencode" && (m.modelID || m.id) === "big-pickle"))
+          .map((m) => m.modelID || m.id)
+      ),
+    ];
+  } else {
+    const r = await ocReq("GET", "/provider");
+    if (r.status !== 200 || !r.json?.all) throw new Error("failed to list opencode providers");
+    const oc = r.json.all.find((p) => p.id === "opencode");
+    modelCache = oc ? Object.keys(oc.models || {}) : [];
   }
+  if (!modelCache.length) throw new Error("no opencode models found");
+  return modelCache;
+}
 
-  const content = [];
-  if (choice.message?.content) {
-    content.push({ type: "text", text: choice.message.content });
+// ── translation: chat formats → opencode prompt ─────────────────────
+function extractText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        if (c.type === "text") return c.text ?? "";
+        if (c.type === "tool_result")
+          return typeof c.content === "string"
+            ? c.content
+            : Array.isArray(c.content)
+              ? c.content.map((x) => x.text || "").join("\n")
+              : "";
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
   }
-  if (choice.message?.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      let input = {};
-      try { input = JSON.parse(tc.function.arguments); } catch {}
-      content.push({
-        type: "tool_use",
-        id: tc.id || ocId("toolu"),
-        name: tc.function.name,
-        input,
-      });
+  return "";
+}
+
+function messagesToPrompt(messages) {
+  let system = "";
+  const turns = [];
+  for (const m of messages || []) {
+    if (m.role === "system") system += (system ? "\n\n" : "") + extractText(m.content);
+    else turns.push(`${m.role === "assistant" ? "Assistant" : "User"}: ${extractText(m.content)}`);
+  }
+  const lastUserText = [...turns].reverse().find((t) => t.startsWith("User:"))?.slice(6) ?? "";
+  return { system, transcript: turns.join("\n\n"), lastUserText };
+}
+
+function anthropicToPrompt(body) {
+  const system = typeof body.system === "string" ? body.system : extractText(body.system);
+  const { transcript, lastUserText } = messagesToPrompt(body.messages);
+  return { system, transcript, lastUserText };
+}
+
+// ── sessions ────────────────────────────────────────────────────────
+const sessions = new Map(); // key -> { sessionID, modelId, turns, chain }
+function sessionEntry(key) {
+  if (!sessions.has(key)) sessions.set(key, { sessionID: null, modelId: null, turns: 0, chain: Promise.resolve() });
+  return sessions.get(key);
+}
+
+function upstreamError(r) {
+  const msg =
+    r.json?.data?.message ||
+    r.json?.error?.message ||
+    r.json?.message ||
+    `opencode server returned ${r.status}`;
+  const err = new Error(msg);
+  err.status = r.status === 429 ? 429 : r.status === 400 ? 400 : r.status === 401 ? 401 : 502;
+  return err;
+}
+
+// Model reference differs between API generations:
+// v2 `{ providerID, id }` (set on the session), v1 `{ modelID, providerID }` (per message).
+const modelRef = (modelId) =>
+  apiVersion === "v2"
+    ? { providerID: "opencode", id: modelId }
+    : { modelID: modelId, providerID: "opencode" };
+
+async function createSession(modelId) {
+  if (apiVersion === "v2") {
+    const r = await ocReq("POST", "/api/session", { model: modelRef(modelId) });
+    if (r.status !== 200 || !r.json?.data?.id) throw upstreamError(r);
+    return r.json.data.id;
+  }
+  const r = await ocReq("POST", "/session", {});
+  if (r.status !== 200 || !r.json?.id) throw upstreamError(r);
+  return r.json.id;
+}
+
+async function switchSessionModel(sessionID, modelId) {
+  if (apiVersion !== "v2") return; // v1 takes the model on every message
+  const r = await ocReq("POST", `/api/session/${sessionID}/model`, { model: modelRef(modelId) });
+  if (r.status !== 200 && r.status !== 204) throw upstreamError(r);
+}
+
+function deleteSession(sessionID) {
+  const path = apiVersion === "v2" ? `/api/session/${sessionID}` : `/session/${sessionID}`;
+  ocReq("DELETE", path).catch(() => {});
+}
+
+// One synchronous-looking turn on the v2 API: admit the prompt, wait for the
+// agent loop to go idle, then read the newest assistant message back.
+async function runTurn(sessionID, { system, modelId, text }) {
+  if (apiVersion === "v2") {
+    // v2 prompts have no `system` field — fold it into the prompt text
+    const t = system ? `${system}\n\n${text}` : text;
+    const p = await ocReq("POST", `/api/session/${sessionID}/prompt`, { text: t });
+    if (p.status !== 200) throw upstreamError(p);
+    const w = await ocReq("POST", `/api/experimental/session/${sessionID}/wait`);
+    if (w.status !== 204 && w.status !== 200) throw upstreamError(w);
+    const r = await ocReq("GET", `/api/session/${sessionID}/message?order=desc&limit=5`);
+    const messages = r.status === 200 && Array.isArray(r.json?.data) ? r.json.data : null;
+    if (!messages) throw upstreamError(r);
+    const idle = messages.find((m) => m.type === "idle");
+    if (idle?.outcome === "failed") {
+      const err = new Error(idle.error?.message || "opencode agent run failed");
+      err.status = idle.error?.status === 429 ? 429 : 502;
+      throw err;
+    }
+    const assistant = messages.find((m) => m.type === "assistant");
+    if (!assistant) throw new Error("empty response from opencode");
+    return extractMessageV2(assistant);
+  }
+  // v1: a single synchronous message call
+  const r = await ocReq("POST", `/session/${sessionID}/message`, {
+    ...(system ? { system } : {}),
+    model: modelRef(modelId),
+    parts: [{ type: "text", text }],
+  });
+  if (r.status !== 200) throw upstreamError(r);
+  return extractMessageV1(r.json);
+}
+
+async function ask({ key, system, modelId, transcript, lastUserText }) {
+  if (!key) {
+    // stateless: fresh session, replay the whole transcript for context
+    const sessionID = await createSession(modelId);
+    try {
+      return await runTurn(sessionID, { system, modelId, text: transcript || lastUserText });
+    } finally {
+      deleteSession(sessionID);
     }
   }
-  if (!content.length) content.push({ type: "text", text: "" });
+  // stateful: pin one opencode session per key; first turn replays the
+  // transcript, later turns send only the newest user message
+  const entry = sessionEntry(key);
+  const run = entry.chain.then(async () => {
+    if (!entry.sessionID) {
+      entry.sessionID = await createSession(modelId);
+      entry.modelId = modelId;
+      entry.turns = 0;
+    } else if (entry.modelId !== modelId) {
+      await switchSessionModel(entry.sessionID, modelId);
+      entry.modelId = modelId;
+    }
+    const text = entry.turns === 0 ? (transcript || lastUserText) : lastUserText;
+    entry.turns++;
+    return runTurn(entry.sessionID, { system, modelId, text });
+  });
+  entry.chain = run.catch(() => {});
+  return run;
+}
 
-  let stopReason = "end_turn";
-  if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
-  else if (choice.finish_reason === "length") stopReason = "max_tokens";
-  else if (choice.finish_reason === "stop") stopReason = "end_turn";
-
+// ── translation: opencode message → chat formats ────────────────────
+function extractMessageV2(message) {
+  let text = "";
+  let reasoning = "";
+  for (const p of message?.content || []) {
+    if (p.type === "text") text += p.text ?? "";
+    else if (p.type === "reasoning") reasoning += p.text ?? "";
+  }
+  const tokens = message?.tokens || {};
   return {
-    id: ocId("msg"),
-    type: "message",
-    role: "assistant",
-    content,
-    model,
-    stop_reason: stopReason,
+    text,
+    reasoning,
+    inputTokens: tokens.input ?? 0,
+    outputTokens: tokens.output ?? 0,
+    finish: message?.finish,
+  };
+}
+
+function extractMessageV1(message) {
+  let text = "";
+  let reasoning = "";
+  for (const p of message?.parts || []) {
+    if (p.type === "text") text += p.text ?? "";
+    else if (p.type === "reasoning") reasoning += p.text ?? "";
+  }
+  const tokens = message?.info?.tokens || {};
+  return {
+    text,
+    reasoning,
+    inputTokens: tokens.input ?? 0,
+    outputTokens: tokens.output ?? 0,
+    finish: message?.info?.finish,
+  };
+}
+
+function mapFinish(finish) {
+  return finish === "length" ? "length" : "stop";
+}
+
+const rid = (prefix) => prefix + crypto.randomBytes(12).toString("hex");
+
+function openaiResponse(modelId, r) {
+  return {
+    id: rid("chatcmpl-"),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelId,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: r.text,
+          ...(r.reasoning ? { reasoning_content: r.reasoning } : {}),
+        },
+        finish_reason: mapFinish(r.finish),
+      },
+    ],
     usage: {
-      input_tokens: oaiResp.usage?.prompt_tokens || inputTokens || 0,
-      output_tokens: oaiResp.usage?.completion_tokens || 0,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      prompt_tokens: r.inputTokens,
+      completion_tokens: r.outputTokens,
+      total_tokens: r.inputTokens + r.outputTokens,
     },
   };
 }
 
-// Stream OpenAI SSE → Anthropic SSE
-function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
-  const msgId = ocId("msg");
-
-  const req = https.request(zenOpts, (zenRes) => {
-    let headersSent = false;
-    let buffer = "";
-    let outputTokens = 0;
-    let contentIdx = 0;
-    let toolIdx = -1;
-    let firstChunkHandled = false;
-
-    function sendSSE(event, data) {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      if (res.flush) res.flush();
-    }
-
-    function sendHeaders() {
-      if (headersSent) return;
-      headersSent = true;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.flushHeaders();
-
-      sendSSE("message_start", {
-        type: "message_start",
-        message: {
-          id: msgId, type: "message", role: "assistant", content: [],
-          model, stop_reason: null,
-          usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-        },
-      });
-    }
-
-    zenRes.on("data", (chunk) => {
-      const str = chunk.toString();
-
-      // Check for errors on first chunk
-      if (!firstChunkHandled) {
-        firstChunkHandled = true;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"'))) {
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error || parsed.type === "error") {
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit";
-              if (!res.headersSent) {
-                res.writeHead(429, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({
-                  type: "error",
-                  error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
-                }));
-              }
-              zenRes.resume();
-              return;
-            }
-          } catch {}
-        }
-      }
-
-      buffer += str;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6).trim();
-        if (payload === "[DONE]") continue;
-
-        let parsed;
-        try { parsed = JSON.parse(payload); } catch { continue; }
-        const delta = parsed.choices?.[0]?.delta;
-        if (!delta) continue;
-
-        sendHeaders();
-
-        // Text content
-        if (delta.content) {
-          if (contentIdx === 0 && toolIdx === -1) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            contentIdx = 1;
-          }
-          sendSSE("content_block_delta", {
-            type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: delta.content },
-          });
-          outputTokens += Math.ceil(delta.content.length / 4);
-        }
-
-        // Tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            if (idx > toolIdx) {
-              // Close previous text block if open
-              if (toolIdx === -1 && contentIdx > 0) {
-                sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-              }
-              toolIdx = idx;
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", {
-                type: "content_block_start", index: blockIdx,
-                content_block: { type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "" },
-              });
-            }
-            if (tc.function?.arguments) {
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_delta", {
-                type: "content_block_delta", index: blockIdx,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-              });
-              outputTokens += Math.ceil(tc.function.arguments.length / 4);
-            }
-          }
-        }
-
-        // Finish
-        if (parsed.choices?.[0]?.finish_reason) {
-          const fr = parsed.choices[0].finish_reason;
-          // Close open blocks
-          const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i++) {
-            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-          }
-
-          let stopReason = "end_turn";
-          if (fr === "tool_calls") stopReason = "tool_use";
-          else if (fr === "length") stopReason = "max_tokens";
-
-          sendSSE("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: stopReason },
-            usage: { output_tokens: outputTokens },
-          });
-          sendSSE("message_stop", { type: "message_stop" });
-        }
-      }
-    });
-
-    zenRes.on("end", () => {
-      if (!headersSent) {
-        if (!res.headersSent) {
-          res.status(502).json({ type: "error", error: { type: "upstream_error", message: "Empty response" } });
-        }
-        return;
-      }
-      res.end();
-    });
+function openaiStream(res, modelId, r) {
+  const id = rid("chatcmpl-");
+  const created = Math.floor(Date.now() / 1000);
+  const chunk = (delta, finish) =>
+    `data: ${JSON.stringify({
+      id, object: "chat.completion.chunk", created, model: modelId,
+      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    })}\n\n`;
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
   });
-
-  req.on("error", (e) => {
-    console.log("[ZEN ERROR]", e.message);
-    if (!res.headersSent) {
-      res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
-    }
-  });
-
-  req.on("timeout", () => {
-    req.destroy();
-    if (!res.headersSent) {
-      res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
-    }
-  });
-
-  req.write(body);
-  req.end();
+  res.write(chunk({ role: "assistant" }));
+  if (r.reasoning) res.write(chunk({ reasoning_content: r.reasoning }));
+  if (r.text) res.write(chunk({ content: r.text }));
+  res.write(chunk({}, mapFinish(r.finish)));
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
-// ── Routes: OpenAI format ──────────────────────────────────────────
-app.get("/v1/models", (_req, res) => {
-  res.json({
-    object: "list",
-    data: MODELS.map((id) => ({
-      id, object: "model", created: 1779000000, owned_by: "opencode-free",
-    })),
+function anthropicResponse(modelId, r) {
+  return {
+    id: rid("msg_"),
+    type: "message",
+    role: "assistant",
+    model: modelId,
+    content: [{ type: "text", text: r.text }],
+    stop_reason: r.finish === "length" ? "max_tokens" : "end_turn",
+    usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
+  };
+}
+
+function anthropicStream(res, modelId, r) {
+  const id = rid("msg_");
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
   });
-});
+  send("message_start", {
+    type: "message_start",
+    message: {
+      id, type: "message", role: "assistant", content: [], model: modelId,
+      stop_reason: null, usage: { input_tokens: r.inputTokens, output_tokens: 0 },
+    },
+  });
+  send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+  if (r.text) send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: r.text } });
+  send("content_block_stop", { type: "content_block_stop", index: 0 });
+  send("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: r.finish === "length" ? "max_tokens" : "end_turn" },
+    usage: { output_tokens: r.outputTokens },
+  });
+  send("message_stop", { type: "message_stop" });
+  res.end();
+}
 
-app.post("/v1/chat/completions", (req, res) => {
-  const user = auth(req);
-  if (!user) return res.status(401).json({ error: { message: "Invalid API key" } });
+// ── HTTP API ────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json({ limit: "10mb" }));
 
-  const { model, messages, stream, tools, tool_choice } = req.body;
-  if (!MODELS.includes(model)) {
-    return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+app.get("/v1/models", async (req, res) => {
+  if (!auth(req) && !isLocalClient(req)) return res.status(401).json({ error: { message: "Invalid API key" } });
+  try {
+    const models = await getModels();
+    res.json({
+      object: "list",
+      data: models.map((id) => ({ id, object: "model", created: 1779000000, owned_by: "opencode" })),
+    });
+  } catch (e) {
+    res.status(502).json({ error: { message: e.message, type: "upstream_error" } });
   }
-
-  const sessionId = getSession(user);
-  const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
-  console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
-
-  const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId);
-  pipeZenResponse(options, body, stream, res);
 });
 
-// ── Routes: Anthropic Messages format ──────────────────────────────
+app.post("/v1/chat/completions", async (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: { message: "Invalid API key" } });
+  try {
+    const { model, messages, stream, user: userId } = req.body || {};
+    const modelId = String(model || "").replace(/^opencode\//, "");
+    const models = await getModels();
+    if (!models.includes(modelId)) {
+      return res.status(400).json({
+        error: { message: `Unknown model: ${modelId}. Available: ${models.join(", ")}` },
+      });
+    }
+    const { system, transcript, lastUserText } = messagesToPrompt(messages);
+    if (!lastUserText) return res.status(400).json({ error: { message: "No user message in request" } });
+    const key = req.headers["x-oc-session"] || userId || null;
+    const extracted = await ask({ key, system, modelId, transcript, lastUserText });
+    if (!extracted.text && !extracted.reasoning) throw new Error("empty response from opencode");
+    if (stream) return openaiStream(res, modelId, extracted);
+    return res.json(openaiResponse(modelId, extracted));
+  } catch (e) {
+    return res.status(e.status || 502).json({ error: { message: e.message, type: "upstream_error" } });
+  }
+});
+
 app.post("/v1/messages", async (req, res) => {
-  const user = auth(req);
-  if (!user) {
-    return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "Invalid API key" } });
-  }
-
-  const { model, stream } = req.body;
-  if (!MODELS.includes(model)) {
-    return res.status(400).json({
+  if (!auth(req)) return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "Invalid API key" } });
+  try {
+    const { model, stream, metadata } = req.body || {};
+    const modelId = String(model || "").replace(/^opencode\//, "");
+    const models = await getModels();
+    if (!models.includes(modelId)) {
+      return res.status(400).json({
+        type: "error",
+        error: { type: "invalid_request_error", message: `Unknown model: ${modelId}. Available: ${models.join(", ")}` },
+      });
+    }
+    const { system, transcript, lastUserText } = anthropicToPrompt(req.body);
+    if (!lastUserText) {
+      return res.status(400).json({
+        type: "error",
+        error: { type: "invalid_request_error", message: "No user message in request" },
+      });
+    }
+    const key = req.headers["x-oc-session"] || metadata?.user_id || null;
+    const extracted = await ask({ key, system, modelId, transcript, lastUserText });
+    if (!extracted.text && !extracted.reasoning) throw new Error("empty response from opencode");
+    if (stream) return anthropicStream(res, modelId, extracted);
+    return res.json(anthropicResponse(modelId, extracted));
+  } catch (e) {
+    return res.status(e.status || 502).json({
       type: "error",
-      error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` },
+      error: { type: e.status === 429 ? "rate_limit_error" : "upstream_error", message: e.message },
     });
   }
-
-  const sessionId = getSession(user);
-  const { messages, tools } = anthropicToOpenAI(req.body);
-  const inputTokens = JSON.stringify(messages).length / 4 | 0;
-
-  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
-
-  const { body, options } = zenRequest(model, messages, stream, tools, undefined, sessionId);
-
-  if (stream) {
-    pipeZenAsAnthropic(options, body, model, res, inputTokens);
-  } else {
-    try {
-      const zenResp = await zenRequestFull(options, body);
-      if (zenResp.status === 429 || zenResp.data?.error) {
-        const errMsg = zenResp.data?.error?.message || "Rate limit exceeded";
-        return res.status(429).json({
-          type: "error", error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
-        });
-      }
-      if (!zenResp.data?.choices) {
-        return res.status(502).json({
-          type: "error", error: { type: "upstream_error", message: "Invalid upstream response" },
-        });
-      }
-      res.json(openAIToAnthropic(zenResp.data, model, inputTokens));
-    } catch (e) {
-      console.log("[ZEN ERROR]", e.message);
-      res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
-    }
-  }
 });
 
-// ── Health ──────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({
-  status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
-  endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
-}));
+app.get("/health", async (_req, res) => {
+  let alive = false;
+  if (ocBase) {
+    try { const r = await Promise.race([ocReq("GET", apiVersion === "v1" ? "/provider" : "/api/info"), new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 4000))]); alive = r.status === 200; } catch {}
+  }
+  res.status(alive ? 200 : 503).json({ status: alive ? "ok" : "backend_down", opencode: ocBase, api: apiVersion, models: modelCache ? modelCache.length : 0 });
+});
 
-// ── Start ──────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
+// ── start ───────────────────────────────────────────────────────────
+app.listen(PROXY_PORT, "0.0.0.0", async () => {
+  console.log(`oc-api-proxy on http://0.0.0.0:${PROXY_PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
   console.log("  Models:    GET  /v1/models");
-  console.log("  Health:    GET  /health");
-  console.log("  Models:", MODELS.join(", "));
-  for (const [name, key] of Object.entries(apiKeys)) {
-    console.log(`  ${name.padEnd(15)} ${key}`);
+  try {
+    await startBackend();
+    const models = await getModels();
+    backendReady = true;
+    console.log("  Models:", models.join(", "));
+    fs.writeFileSync(path.join(HERE, "server.pid"), JSON.stringify({ pid: process.pid, started: Date.now() }));
+  } catch (e) {
+    console.error("  Failed to start opencode backend:", e.message);
+    process.exit(1);
   }
+  for (const [name, key] of Object.entries(apiKeys)) console.log(`  ${name.padEnd(15)} ${key}`);
 });

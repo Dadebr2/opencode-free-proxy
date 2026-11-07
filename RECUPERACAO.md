@@ -16,3 +16,15 @@ A tarefa OpenCode Free Proxy Recovery inicia no logon e tenta iniciar novamente 
 Validacao em 07/11/2026: o servico foi interrompido e iniciado novamente pelo monitor; o catalogo apresentou 11 modelos e o DeepSeek respondeu. O inicio em um novo logon nao foi testado. A tarefa levou alguns minutos para iniciar nesta maquina.
 
 O monitor nao corrige indisponibilidade dos modelos externos. Pedidos em andamento podem ser interrompidos durante a recuperacao.
+
+## Atualizacao 07/11/2026: recuperacao em duas camadas
+
+Causa da parada recorrente: o processo interno `opencode serve` encerrava (codigo 3221225786) e o servidor continuava respondendo /health com status ok, sem conseguir atender pedidos (erro 502). O monitor via o servico como saudavel e nao agia. Alem disso, ele dependia do PowerShell para localizar processos, e essas chamadas expiravam (ETIMEDOUT).
+
+Correcoes:
+
+1. server.mjs reinicia sozinho o `opencode serve` quando ele cai, sem derrubar a porta 6446.
+2. /health testa o processo interno de verdade e devolve 503 quando ele nao responde.
+3. server.mjs grava server.pid; o watchdog.cjs usa esse arquivo para encerrar e reiniciar o servidor sem depender do PowerShell.
+
+Validacao em 07/11/2026: processo interno derrubado as 16:25:56 e recuperado pelo proprio servidor em segundos; servidor inteiro derrubado as 16:27:36 e reiniciado pelo monitor as 16:27:58. Depois disso o DeepSeek e o Combo-OC-Free responderam pelo OpenCodex.

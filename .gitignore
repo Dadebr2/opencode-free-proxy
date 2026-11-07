@@ -10,3 +10,5 @@ task-backup-*.xml
 models-cache.json
 oc-workspace/
 watchdog-node.vbs
+server.pid
+*.bak-*
