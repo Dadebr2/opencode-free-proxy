@@ -1,30 +1,43 @@
 # Recuperacao automatica no Windows
 
-O monitor watchdog.cjs verifica o servico a cada 30 segundos. Se ele nao responder, confirma a falha e tenta inicia-lo novamente. Eventos sao registrados em watchdog.log.
+Esta versao mantem o OC-Free funcionando sozinho e sem janelas de terminal.
 
-Requer Node.js 18 ou superior e o PowerShell do runtime do Codex em %USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe para identificar o processo antes de reiniciar. O servidor recebe NODE_USE_SYSTEM_CA=1.
+## O que estava errado
 
-Para instalar e iniciar o monitor no Windows, execute na pasta do projeto:
+O processo interno `opencode serve` encerra sozinho de vez em quando (codigo 3221225786). O servidor continuava respondendo `/health` com status ok, mas recusava os pedidos com erro 502. O monitor acreditava no status e nao agia. Alem disso, ele usava o PowerShell para localizar processos, e essas chamadas expiravam (ETIMEDOUT).
 
+## Como funciona agora
+
+1. **Dentro do servidor:** se o `opencode serve` encerrar, o `server.mjs` o reinicia em 2 segundos, sem tirar a porta 6446 do ar.
+2. **Verificacao real:** `/health` testa o `opencode serve` e responde 503 `backend_down` quando ele nao responde.
+3. **Monitor:** `watchdog.cjs` verifica a cada 30 segundos. Se a falha se confirmar e o servidor tiver mais de 3 minutos de vida, encerra o processo indicado em `server.pid` e inicia outro. Nao depende do PowerShell.
+4. **Windows:** a tarefa `OpenCode Free Proxy Recovery` inicia o monitor no logon e tenta a cada minuto, com uma instancia so e sem limite de tempo. Ela usa `wscript.exe` com `watchdog-node.vbs`, entao nenhuma janela aparece.
+
+## Instalar
+
+Requer Node.js 18+ e `npm install -g @opencode/cli` com a conta OpenCode conectada. Na pasta do projeto:
+
+    npm install
     node register-recovery.cjs "%CD%"
 
-A tarefa OpenCode Free Proxy Recovery inicia no logon e tenta iniciar novamente a cada minuto, mantendo apenas uma instancia e sem limite de duracao. Remover a configuracao antiga do registro evita uma inicializacao duplicada. Para desativar a tarefa, execute:
+O registro encerra monitor e servidor anteriores do OC-Free para a nova instalacao assumir a porta. Se outra aplicacao ocupar a porta 6446, ele para e avisa.
 
-    schtasks /Change /TN "OpenCode Free Proxy Recovery" /Disable
-    schtasks /End /TN "OpenCode Free Proxy Recovery"
+## Operar
 
-Validacao em 07/11/2026: o servico foi interrompido e iniciado novamente pelo monitor; o catalogo apresentou 11 modelos e o DeepSeek respondeu. O inicio em um novo logon nao foi testado. A tarefa levou alguns minutos para iniciar nesta maquina.
+- Reiniciar: `schtasks /Run /TN "OpenCode Free Proxy Recovery"`
+- Desativar: `schtasks /Change /TN "OpenCode Free Proxy Recovery" /Disable` e encerrar os processos node de `watchdog.cjs` e `server.mjs`.
+- Registros: `watchdog.log` (acoes do monitor) e `opencode-free-proxy.log` (linha `[OC] backend recuperado` quando o servidor reinicia o processo interno).
 
-O monitor nao corrige indisponibilidade dos modelos externos. Pedidos em andamento podem ser interrompidos durante a recuperacao.
+## Validacao (07/11/2026)
 
-## Atualizacao 07/11/2026: recuperacao em duas camadas
+- Processo interno encerrado as 16:25:56; o servidor o reiniciou sozinho em segundos.
+- Servidor encerrado as 16:27:36; o monitor iniciou outro as 16:27:58.
+- Instalacao nova em pasta limpa; servidor encerrado as 16:55:41 e iniciado de novo as 16:56:08.
+- Nenhuma janela visivel nos processos do OC-Free.
+- DeepSeek e Combo-OC-Free responderam pelo OpenCodex depois das recuperacoes.
 
-Causa da parada recorrente: o processo interno `opencode serve` encerrava (codigo 3221225786) e o servidor continuava respondendo /health com status ok, sem conseguir atender pedidos (erro 502). O monitor via o servico como saudavel e nao agia. Alem disso, ele dependia do PowerShell para localizar processos, e essas chamadas expiravam (ETIMEDOUT).
+## Limites
 
-Correcoes:
-
-1. server.mjs reinicia sozinho o `opencode serve` quando ele cai, sem derrubar a porta 6446.
-2. /health testa o processo interno de verdade e devolve 503 quando ele nao responde.
-3. server.mjs grava server.pid; o watchdog.cjs usa esse arquivo para encerrar e reiniciar o servidor sem depender do PowerShell.
-
-Validacao em 07/11/2026: processo interno derrubado as 16:25:56 e recuperado pelo proprio servidor em segundos; servidor inteiro derrubado as 16:27:36 e reiniciado pelo monitor as 16:27:58. Depois disso o DeepSeek e o Combo-OC-Free responderam pelo OpenCodex.
+- O inicio apos um novo logon esta configurado, mas nao foi testado.
+- Pedidos em andamento podem ser interrompidos durante uma recuperacao.
+- O monitor nao resolve modelo fora do ar no servico externo.

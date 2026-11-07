@@ -592,7 +592,7 @@ app.post("/v1/messages", async (req, res) => {
 app.get("/health", async (_req, res) => {
   let alive = false;
   if (ocBase) {
-    try { const r = await Promise.race([ocReq("GET", apiVersion === "v1" ? "/provider" : "/api/info"), new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 4000))]); alive = r.status === 200; } catch {}
+    try { const r = await Promise.race([ocReq("GET", apiVersion === "v1" ? "/provider" : "/api/info"), new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 12000))]); alive = r.status === 200; } catch {}
   }
   res.status(alive ? 200 : 503).json({ status: alive ? "ok" : "backend_down", opencode: ocBase, api: apiVersion, models: modelCache ? modelCache.length : 0 });
 });
