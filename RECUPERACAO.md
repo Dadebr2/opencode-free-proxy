@@ -1,21 +1,18 @@
 # Recuperacao automatica no Windows
 
-O arquivo watchdog.cjs verifica http://127.0.0.1:6446/health a cada 30 segundos. Confirma a falha antes de iniciar o servidor e aguarda tres minutos para processos novos. Eventos ficam em watchdog.log.
+O monitor watchdog.cjs verifica o servico a cada 30 segundos. Se ele nao responder, confirma a falha e tenta inicia-lo novamente. Eventos sao registrados em watchdog.log.
 
-Requer Node.js 18 ou superior e PowerShell atual no caminho do runtime do Codex em %USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe. Esse caminho e usado para identificar os processos do servidor antes de reinicia-los. O servidor recebe NODE_USE_SYSTEM_CA=1.
+Requer Node.js 18 ou superior e o PowerShell do runtime do Codex em %USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe para identificar o processo antes de reiniciar. O servidor recebe NODE_USE_SYSTEM_CA=1.
 
-Para registrar a inicializacao na entrada do Windows, execute no diretorio do projeto:
+Para instalar e iniciar o monitor no Windows, execute na pasta do projeto:
 
     node register-recovery.cjs "%CD%"
 
-Isso gera um iniciador oculto watchdog-node.vbs e registra HKCU\Software\Microsoft\Windows\CurrentVersion\Run\OpenCodeFreeProxyRecovery. Para iniciar imediatamente, abra outro terminal e execute node watchdog.cjs. Mantenha somente uma instancia do monitor.
+A tarefa OpenCode Free Proxy Recovery inicia no logon e tenta iniciar novamente a cada minuto, mantendo apenas uma instancia e sem limite de duracao. Remover a configuracao antiga do registro evita uma inicializacao duplicada. Para desativar a tarefa, execute:
 
-Para desativar a inicializacao automatica:
+    schtasks /Change /TN "OpenCode Free Proxy Recovery" /Disable
+    schtasks /End /TN "OpenCode Free Proxy Recovery"
 
-    reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v OpenCodeFreeProxyRecovery /f
+Validacao em 07/11/2026: o servico foi interrompido e iniciado novamente pelo monitor; o catalogo apresentou 11 modelos e o DeepSeek respondeu. O inicio em um novo logon nao foi testado. A tarefa levou alguns minutos para iniciar nesta maquina.
 
-Encerre tambem o processo node que executa watchdog.cjs, caso esteja ativo. Nao encerre outros processos Node.
-
-Validacao em 06/11/2026: processo do servidor encerrado as 18:25:47; monitor iniciou outro automaticamente as 18:26:09. O catalogo voltou com dez modelos; DeepSeek respondeu diretamente e pelo OpenCodex. A inicializacao apos novo logon foi registrada, sem encerrar a sessao para testa-la.
-
-O monitor nao corrige indisponibilidade dos modelos no servico externo. Uma recuperacao pode interromper chamadas em andamento. Esta alteracao inclui apenas a recuperacao; modificacoes anteriores do servidor local nao fazem parte dela.
+O monitor nao corrige indisponibilidade dos modelos externos. Pedidos em andamento podem ser interrompidos durante a recuperacao.
