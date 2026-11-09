@@ -6,7 +6,7 @@ $watch = Join-Path $ProxyDir 'watchdog.cjs'
 if (-not (Test-Path -LiteralPath $watch)) { throw 'watchdog.cjs nao encontrado' }
 $vbs = Join-Path $ProxyDir 'watchdog-node.vbs'
 $q = [char]34
-$line = 'CreateObject("WScript.Shell").Run "' + $q + $q + $NodePath + $q + $q + ' ' + $q + $q + $watch + $q + $q + '", 0, True'
+$line = 'CreateObject("WScript.Shell").Run "' + $q + $q + $NodePath + $q + $q + ' ' + $q + $q + $watch + $q + $q + '", 0, False'
 Set-Content -LiteralPath $vbs -Value @("' Inicia o monitor do OC-Free sem janela.", $line) -Encoding ascii
 $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "' + $vbs + '"') -WorkingDirectory $ProxyDir
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)

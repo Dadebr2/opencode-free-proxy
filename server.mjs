@@ -44,7 +44,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PROXY_PORT = Number(process.env.PROXY_PORT || 6447);
+const PROXY_PORT = Number(process.env.PROXY_PORT || 6446);
 const OC_SERVER = process.env.OC_SERVER;
 const OC_USERNAME = process.env.OC_USERNAME || "opencode";
 const OC_PASSWORD = process.env.OC_PASSWORD;
@@ -190,7 +190,7 @@ async function startBackend() {
     if (!backendReady) return;
     backendReady = false;
     console.log("[OC] reiniciando opencode serve em 2s...");
-    setTimeout(() => startBackend().then(() => getModels()).then((m) => { backendReady = true; console.log("[OC] backend recuperado:", m.length, "modelos"); }).catch((e) => { console.error("[OC] falha ao recuperar backend:", e.message); process.exit(1); }), 2000);
+    setTimeout(() => startBackend().then(() => getModels()).then((m) => { backendReady = true;  console.log("[OC] backend recuperado:", m.length, "modelos"); }).catch((e) => { console.error("[OC] falha ao recuperar backend:", e.message); process.exit(1); }), 2000);
   });
   if (!exitHooked) {
     exitHooked = true;
@@ -589,12 +589,14 @@ app.post("/v1/messages", async (req, res) => {
   }
 });
 
-app.get("/health", async (_req, res) => {
-  let alive = false;
-  if (ocBase) {
-    try { const r = await Promise.race([ocReq("GET", apiVersion === "v1" ? "/provider" : "/api/info"), new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 12000))]); alive = r.status === 200; } catch {}
-  }
-  res.status(alive ? 200 : 503).json({ status: alive ? "ok" : "backend_down", opencode: ocBase, api: apiVersion, models: modelCache ? modelCache.length : 0 });
+app.get("/health", (_req, res) => {
+  const alive = Boolean(backendReady && ocChild && !ocChild.killed && ocBase && modelCache && modelCache.length > 0);
+  res.status(alive ? 200 : 503).json({
+    status: alive ? "ok" : "backend_down",
+    opencode: ocBase,
+    api: apiVersion,
+    models: modelCache ? modelCache.length : 0,
+  });
 });
 
 // ── start ───────────────────────────────────────────────────────────
