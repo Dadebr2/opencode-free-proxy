@@ -1,22 +1,26 @@
-# Recuperacao automatica no Windows (v1.1.0 definitiva)
+# OC-Free 1.2.0 — recuperacao apos reinicio
 
-Esta versao mantem o OC-Free funcionando de forma resiliente, permanente e 100% headless (sem qualquer janela visivel).
+Esta versao corrige falhas observadas com OpenCode v2.3.0 e evita processos OC-Free acumulados.
 
-## Diagnostico da falha pos-reinicio
+## Mudancas
 
-Apos o reinicio da maquina, ocorreram duas condicoes criticas que deixavam o servico fora do ar:
-1. **/health bloqueante causava falsos positivos**: durante chamadas longas de inferencia (ex.: DeepSeek levando ~70s), o endpoint `/health` tentava fazer requisicao HTTP interna que demorava ou expirava em 12s, respondendo falsamente 503 `backend_down`. O monitor acreditava que o servico havia morrido e tentava mata-lo repetidamente a cada poucos minutos.
-2. **Processo zumbi retendo a porta 6446**: o `taskkill /PID <pid> /T /F` expirava por timeout no Windows (ETIMEDOUT). Como o processo antigo continuava vivo segurando a porta 6446, qualquer tentativa de reinicio falhava com `EADDRINUSE: address already in use 0.0.0.0:6446`.
+- O servidor aguarda ate 120 segundos para o `opencode serve` iniciar e ate 180 segundos para a lista de modelos ficar pronta, incluindo a ativacao de plugins.
+- O PID do servidor e gravado logo no inicio, para que o monitor consiga encontra-lo mesmo se o inicio do backend falhar.
+- Um teste de atividade em segundo plano acompanha o backend sem atrasar `/health`; chamadas longas dos modelos nao devem ser confundidas com queda.
+- O watchdog encerra processos OC-Free orfaos, espera a porta 6446 ficar livre e so entao inicia outro servidor. A porta 6445 impede dois watchdogs simultaneos.
 
-## Correcoes estruturais (v1.1.0)
+## Validacao registrada em 14/11/2026
 
-1. **/health instantaneo e nao-bloqueante**: a saude do backend agora reflete diretamente o estado do processo filho `ocChild` gerenciado pelo `server.mjs`. O `/health` responde em ~20ms, sem requisicoes HTTP internas que possam bloquear durante inferencias longas.
-2. **Liberacao garantida da porta 6446**: antes de qualquer spawn, o `watchdog.cjs` verifica nativamente se a porta 6446 esta ocupada, identifica o PID via `netstat` e executa terminacao direta do processo (`process.kill('SIGKILL')` a nivel de kernel do Windows), aguardando a liberacao total antes de subir o novo processo.
-3. **Trava de instancia unica na porta 6445**: o monitor garante que apenas uma instancia de monitoramento execute por vez via socket loopback. Se uma nova tarefa agendada disparar, ela detecta a porta 6445 e encerra imediatamente.
-4. **Execucao 100% headless assincrona**: o iniciador `watchdog-node.vbs` dispara o monitor com `bWaitOnReturn = False`, garantindo que o Agendador de Tarefas do Windows complete sem travar processos em espera.
+- `opencode serve` v2.3.0 iniciou em aproximadamente 5,5 segundos em teste isolado.
+- A API do OpenCode respondeu 503 durante a ativacao de plugins e 200 cerca de 12 segundos depois; o tratamento permite aguardar ate 180 segundos.
+- O proxy listou 12 modelos free.
+- Uma chamada a `ocx provider test ocfree-local --model mimo-v2.6-flash-free --yes` conectou com sucesso.
+- Uma conversa por `combo/Combo-OC-Free` respondeu `OK`.
 
-## Validacao em 08/11/2026
-- Chamada real de modelo longo (DeepSeek V4.1 Flash, 73.3s de latencia) completada com HTTP 200 sem disparar falsos positivos de saude.
-- Latencia de resposta do /health: ~20-50ms.
-- Janelas visiveis ativas do OC-Free: 0.
-- Reinicio e liberacao de porta validados via netstat e recuperacao automatica.
+## Instalar
+
+Execute `node scripts/install-free-proxy.cjs`. O instalador inclui os arquivos de recuperacao e registra a tarefa headless do Windows. Apos instalar, valide com `node scripts/check-free-proxy.cjs` e uma chamada real a um modelo.
+
+## Limitacoes
+
+O watchdog nao corrige indisponibilidade do modelo no servico externo. Durante a inicializacao, os modelos podem levar alguns segundos para aparecer.
