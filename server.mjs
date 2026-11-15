@@ -190,7 +190,7 @@ async function startBackend() {
     if (!backendReady) return;
     backendReady = false;
     console.log("[OC] reiniciando opencode serve em 2s...");
-    setTimeout(() => startBackend().then(() => getModels()).then((m) => { backendReady = true;  console.log("[OC] backend recuperado:", m.length, "modelos"); }).catch((e) => { console.error("[OC] falha ao recuperar backend:", e.message); process.exit(1); }), 2000);
+    setTimeout(() => startBackend().then(() => getModels()).then((m) => { backendReady = true; lastBackendOk = Date.now();  console.log("[OC] backend recuperado:", m.length, "modelos"); }).catch((e) => { console.error("[OC] falha ao recuperar backend:", e.message); process.exit(1); }), 2000);
   });
   if (!exitHooked) {
     exitHooked = true;
@@ -200,7 +200,7 @@ async function startBackend() {
 
   const port = await new Promise((resolve, reject) => {
     let buf = "";
-    const timer = setTimeout(() => reject(new Error("opencode serve did not start within 45s")), 45000);
+    const timer = setTimeout(() => reject(new Error("opencode serve did not start within 120s")), 120000);
     const onData = (d) => {
       buf += d.toString();
       const m = buf.match(/listening on https?:\/\/[^:]+:(\d+)/);
@@ -221,7 +221,7 @@ let modelCache = null;
 async function getModels() {
   if (modelCache) return modelCache;
   if (apiVersion === "v2") {
-    let r; { const t0 = Date.now(); do { r = await ocReq("GET", "/api/model"); if (r.status === 200) break; if (Date.now() - t0 > 120000) break; console.log("[OC] aguardando plugins (" + r.status + ")..."); await new Promise((x) => setTimeout(x, 3000)); } while (true); }
+    let r; { const t0 = Date.now(); do { r = await ocReq("GET", "/api/model"); if (r.status === 200) break; if (Date.now() - t0 > 180000) break; console.log("[OC] aguardando plugins (" + r.status + ")..."); await new Promise((x) => setTimeout(x, 3000)); } while (true); }
     const all = r.status === 200 ? r.json?.data : null;
     if (!Array.isArray(all)) throw new Error("failed to list opencode models");
     modelCache = [
@@ -589,10 +589,41 @@ app.post("/v1/messages", async (req, res) => {
   }
 });
 
+let lastBackendOk = Date.now();
+let backendChecking = false;
+
+async function checkBackendLiveness() {
+  if (!ocBase || !backendReady || backendChecking) return;
+  backendChecking = true;
+  try {
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 10000);
+    const u = new URL(ocBase + (apiVersion === "v1" ? "/provider" : "/api/model"));
+    const headers = ocAuth ? { Authorization: ocAuth } : {};
+    const res = await fetch(u, { headers, signal: controller.signal });
+    clearTimeout(to);
+    if (res.ok) {
+      lastBackendOk = Date.now();
+    }
+  } catch (e) {
+    // Ping falhou ou demorou
+  } finally {
+    backendChecking = false;
+  }
+
+  // Se o backend travou e nao respondeu com sucesso ha mais de 75s, reinicia o processo filho
+  if (backendReady && Date.now() - lastBackendOk > 75000 && ocChild) {
+    console.log("[OC] backend travado sem responder ha mais de 75s; reiniciando processo filho...");
+    lastBackendOk = Date.now();
+    try { ocChild.kill("SIGKILL"); } catch {}
+  }
+}
+setInterval(checkBackendLiveness, 15000);
+
 app.get("/health", (_req, res) => {
-  const alive = Boolean(backendReady && ocChild && !ocChild.killed && ocBase && modelCache && modelCache.length > 0);
-  res.status(alive ? 200 : 503).json({
-    status: alive ? "ok" : "backend_down",
+  const backendAlive = Boolean(backendReady && ocChild && !ocChild.killed && ocBase && modelCache && modelCache.length > 0 && (Date.now() - lastBackendOk < 90000));
+  res.status(backendAlive ? 200 : 503).json({
+    status: backendAlive ? "ok" : "backend_down",
     opencode: ocBase,
     api: apiVersion,
     models: modelCache ? modelCache.length : 0,
@@ -600,7 +631,8 @@ app.get("/health", (_req, res) => {
 });
 
 // ── start ───────────────────────────────────────────────────────────
-app.listen(PROXY_PORT, "0.0.0.0", async () => {
+const server = app.listen(PROXY_PORT, "0.0.0.0", async () => {
+  server.on("error", (err) => { if (err.code === "EADDRINUSE") { console.error("[FATAL] Porta " + PROXY_PORT + " ocupada; encerrando."); process.exit(1); } });
   console.log(`oc-api-proxy on http://0.0.0.0:${PROXY_PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");

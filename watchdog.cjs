@@ -1,3 +1,4 @@
+
 const fs = require('node:fs');
 const path = require('node:path');
 const cp = require('node:child_process');
@@ -8,6 +9,7 @@ const pidFile = path.join(dir, 'server.pid');
 const PORT = 6446;
 const LOCK_PORT = 6445;
 
+// Instancia unica garantida pelo SO na porta 6445
 const lockServer = net.createServer();
 lockServer.once('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -59,10 +61,17 @@ function readPidFile() {
 function forceKill(pid) {
   if (!pid) return;
   try { process.kill(pid, 'SIGKILL'); } catch {}
-  try { cp.execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 20000 }); } catch {}
+  try { cp.execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15000 }); } catch {}
 }
 
-async function ensurePortFree(maxWaitMs = 15000) {
+function killAllOrphans() {
+  try {
+    const ps = "Get-CimInstance Win32_Process | Where-Object { ($_.CommandLine -like '*opencode-free-proxy*server.mjs*') -or ($_.Name -eq 'opencode.exe' -and $_.CommandLine -like '*serve*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    cp.execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 15000 });
+  } catch {}
+}
+
+async function ensurePortFree(maxWaitMs = 20000) {
   const t0 = Date.now();
   while (Date.now() - t0 < maxWaitMs) {
     const bound = await isPortBound(PORT);
@@ -72,6 +81,7 @@ async function ensurePortFree(maxWaitMs = 15000) {
       log(`Porta ${PORT} ocupada pelo processo ${pid}; finalizando...`);
       forceKill(pid);
     }
+    killAllOrphans();
     await new Promise((r) => setTimeout(r, 1000));
   }
   return !(await isPortBound(PORT));
@@ -87,9 +97,11 @@ async function check() {
     return;
   }
 
+  // Se iniciou ha menos de 90 segundos, aguarda estabilizacao do backend
   if (Date.now() - lastStart < 90000) return;
 
   consecutiveFailures++;
+  // Exige 2 checagens consecutivas sem resposta (intervalo de 30s = 1 minuto de falha)
   if (consecutiveFailures < 2) return;
 
   log(`Servico indisponivel (${h.reachable ? 'HTTP ' + h.status : h.error}); reiniciando...`);
@@ -97,9 +109,11 @@ async function check() {
   const info = readPidFile();
   if (info && info.pid) forceKill(info.pid);
 
+  // Garante que processos orfaos sejam encerrados e a porta esteja livre
+  killAllOrphans();
   const freed = await ensurePortFree(20000);
   if (!freed) {
-    log(`ERRO CRITICO: porta ${PORT} continua ocupada; abortando reinicio.`);
+    log(`ERRO CRITICO: porta ${PORT} continua ocupada apos 20s; abortando reinicio.`);
     return;
   }
 
@@ -107,17 +121,20 @@ async function check() {
 
   const out = fs.openSync(path.join(dir, 'opencode-free-proxy.log'), 'a');
   const err = fs.openSync(path.join(dir, 'opencode-free-proxy-error.log'), 'a');
-  cp.spawn(process.execPath, [path.join(dir, 'server.mjs')], {
+  const child = cp.spawn(process.execPath, [path.join(dir, 'server.mjs')], {
     cwd: dir,
     detached: true,
     windowsHide: true,
     stdio: ['ignore', out, err],
     env: { ...process.env, PROXY_PORT: String(PORT), NODE_USE_SYSTEM_CA: '1' },
-  }).unref();
+  });
+
+  fs.writeFileSync(pidFile, JSON.stringify({ pid: child.pid, started: Date.now() }));
+  child.unref();
 
   lastStart = Date.now();
   consecutiveFailures = 0;
-  log('Recuperacao automatica: servico reiniciado com sucesso.');
+  log(`Recuperacao automatica: processo ${child.pid} iniciado com sucesso.`);
 }
 
 let busy = false;
@@ -127,6 +144,6 @@ async function tick() {
   try { await check(); } catch (e) { log('Falha no watchdog: ' + e.message); } finally { busy = false; }
 }
 
-log('Monitor continuo iniciado (v1.1.0 definitivo).');
+log('Monitor continuo iniciado (v1.2.0 definitivo).');
 tick();
 setInterval(tick, 30000);
