@@ -6,10 +6,11 @@ $watch = Join-Path $ProxyDir 'watchdog.cjs'
 if (-not (Test-Path -LiteralPath $watch)) { throw 'watchdog.cjs nao encontrado' }
 $vbs = Join-Path $ProxyDir 'watchdog-node.vbs'
 $q = [char]34
-$line = 'CreateObject("WScript.Shell").Run "' + $q + $q + $NodePath + $q + $q + ' ' + $q + $q + $watch + $q + $q + '", 0, False'
+$line = 'CreateObject("WScript.Shell").Run "' + $q + $q + $NodePath + $q + $q + ' ' + $q + $q + $watch + $q + $q + '", 0, True'
 Set-Content -LiteralPath $vbs -Value @("' Inicia o monitor do OC-Free sem janela.", $line) -Encoding ascii
 $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "' + $vbs + '"') -WorkingDirectory $ProxyDir
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings.Priority = 4
 $triggers = @((New-ScheduledTaskTrigger -AtLogOn), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 # Encerra monitor e servidor anteriores (qualquer pasta) para a nova instalacao assumir a porta 6446.
